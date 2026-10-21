@@ -5,16 +5,22 @@ const { chromium } = require('playwright');
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
-const option = (name, fallback) => {
+const textOption = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
-  return i !== -1 && args[i + 1] ? Number(args[i + 1]) : fallback;
+  return i !== -1 && args[i + 1] ? args[i + 1] : fallback;
+};
+const option = (name, fallback) => {
+  const value = textOption(name, null);
+  return value === null ? fallback : Number(value);
 };
 
 const DEBUG = flag('debug');
+const PROFILE = textOption('profile', null);
 
 const CONFIG = {
   url: 'https://higgsfield.ai/ai/video?model=genjutsu',
-  profileDir: path.join(__dirname, 'browser-profile'),
+  // Each --profile gets its own Chrome login folder so several copies can run side by side.
+  profileDir: path.join(__dirname, PROFILE ? `browser-profile-${PROFILE.replace(/[^\w-]/g, '_')}` : 'browser-profile'),
   // 'complete' = retry until a video finishes rendering successfully.
   // 'submit'   = stop as soon as Higgsfield accepts the generation request.
   waitFor: flag('submit-only') ? 'submit' : 'complete',
@@ -45,7 +51,8 @@ const IGNORED_URLS = /sentry|amplitude|mixpanel|segment|posthog|analytics|teleme
 
 const isFailedStatus = (s) => FAILED_STATUS.test(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...m) => console.log(`[${new Date().toLocaleTimeString()}]`, ...m);
+const log = (...m) => console.log(`[${new Date().toLocaleTimeString()}]${PROFILE ? ` [${PROFILE}]` : ''}`, ...m);
+const BOT_NAME = PROFILE ? `Higgsfield bot (${PROFILE})` : 'Higgsfield bot';
 const debug = (...m) => DEBUG && log('[debug]', ...m);
 
 function notify(title, message) {
@@ -171,8 +178,15 @@ function recordJobs(node, state) {
   for (const value of Object.values(node)) recordJobs(value, state);
 }
 
+// Only this copy's own jobs count, so other copies running on the same account are left alone.
 const activeJobs = (state) =>
-  [...state.jobs.values()].filter((j) => ACTIVE_STATUS.test(j.status) && Date.now() - j.lastSeen < JOB_STALE_MS);
+  [...state.jobs.values()].filter(
+    (j) => state.botJobs.has(j.id) && ACTIVE_STATUS.test(j.status) && Date.now() - j.lastSeen < JOB_STALE_MS,
+  );
+
+// "Generating" badges on the page cover the whole account, so they are only used
+// when this copy's last click could not be tied to a job.
+const pageBusy = async (page, state) => state.untracked && (await scanPage(page)).busy > 0;
 
 const attemptStatuses = (state, attempt) =>
   [...attempt.ids].map((id) => state.jobs.get(id)?.status).filter(Boolean);
@@ -260,7 +274,7 @@ async function enforceSingleGeneration(page, state) {
       log(`  Cancel failed (${result.detail}); trying again shortly.`);
     } else {
       log(`  Could not cancel the extra generation (${result.detail}). Cancel it by hand in History.`);
-      notify('Higgsfield bot', 'Two generations are running and the extra one could not be cancelled.');
+      notify(BOT_NAME, 'Two generations are running and the extra one could not be cancelled.');
     }
   }
 }
@@ -280,7 +294,7 @@ async function waitUntilIdle(page, state) {
   for (;;) {
     if (botJobSucceeded(state)) return true;
     const active = activeJobs(state);
-    const { busy } = await scanPage(page);
+    const busy = await pageBusy(page, state);
     if (!active.length && !busy) return false;
 
     if (Date.now() - lastLog > 60_000) {
@@ -313,7 +327,7 @@ async function clickGenerate(page, state) {
   while (Date.now() < deadline) {
     const btn = await findGenerateButton(page);
     if (btn && (await btn.isEnabled().catch(() => false))) {
-      if (activeJobs(state).length || (await scanPage(page)).busy) return 'busy';
+      if (activeJobs(state).length || (await pageBusy(page, state))) return 'busy';
       await btn.click();
       return 'clicked';
     }
@@ -405,6 +419,7 @@ async function run(page, state) {
       log('  Waiting for the video to finish...');
       outcome = await waitForCompletion(page, state, attempt, baseline);
     }
+    state.untracked = attempt.ids.size === 0;
 
     if (outcome.result === 'done') return { ok: true };
     if (outcome.result === 'stop') return { ok: false, reason: `Stopped: ${outcome.reason}` };
@@ -419,13 +434,22 @@ async function run(page, state) {
 }
 
 async function main() {
-  const context = await chromium.launchPersistentContext(CONFIG.profileDir, {
-    channel: 'chrome',
-    headless: false,
-    viewport: null,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: ['--disable-blink-features=AutomationControlled', '--start-maximized'],
-  });
+  const context = await chromium
+    .launchPersistentContext(CONFIG.profileDir, {
+      channel: 'chrome',
+      headless: false,
+      viewport: null,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: ['--disable-blink-features=AutomationControlled', '--start-maximized'],
+    })
+    .catch((err) => {
+      if (/ProcessSingleton|already in use|profile.*in use/i.test(err.message)) {
+        console.error(`\nAnother copy of the bot is already using "${path.basename(CONFIG.profileDir)}".`);
+        console.error('Start this copy with its own profile, e.g.: npm run debug -- --profile second\n');
+        process.exit(1);
+      }
+      throw err;
+    });
   const page = context.pages()[0] ?? (await context.newPage());
   const state = {
     attempt: null,
@@ -433,6 +457,7 @@ async function main() {
     botJobs: new Set(),
     cancelTries: new Map(),
     apiHeaders: {},
+    untracked: false,
   };
 
   await page.addInitScript(installWatcher, watcherConfig);
@@ -446,13 +471,13 @@ async function main() {
   });
 
   console.log(`
-Higgsfield Genjutsu auto-generate bot
+Higgsfield Genjutsu auto-generate bot${PROFILE ? ` (profile: ${PROFILE})` : ''}
 -------------------------------------
 1. Log in to Higgsfield in the Chrome window (only needed the first time).
 2. Set everything up: reference video, images, prompt, quality, etc.
 3. Come back here and press Enter. The bot will click Generate and retry
    on failure until a generation ${CONFIG.waitFor === 'submit' ? 'is accepted' : 'finishes successfully'}.
-   Only one generation ever runs at a time; extras are cancelled.
+   This copy only ever runs one generation at a time; its extras are cancelled.
    (${Number.isFinite(CONFIG.maxAttempts) ? `max ${CONFIG.maxAttempts}` : 'unlimited'} attempts, ${CONFIG.retryDelayMs / 1000}s between retries, Ctrl+C to stop)
 `);
   await ask('Press Enter to start... ');
@@ -463,10 +488,10 @@ Higgsfield Genjutsu auto-generate bot
 
   if (result.ok) {
     log('SUCCESS! Your generation passed.');
-    notify('Higgsfield bot', 'Your Genjutsu generation passed!');
+    notify(BOT_NAME, 'Your Genjutsu generation passed!');
   } else {
     log(result.reason);
-    notify('Higgsfield bot', result.reason);
+    notify(BOT_NAME, result.reason);
   }
   log('Browser stays open so you can check the result. Press Ctrl+C to quit.');
   await new Promise(() => {});
