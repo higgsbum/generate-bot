@@ -1,3 +1,4 @@
 node_modules/
 browser-profile*/
+logs/
 .DS_Store

@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const { execFile } = require('child_process');
@@ -16,11 +17,21 @@ const option = (name, fallback) => {
 
 const DEBUG = flag('debug');
 const PROFILE = textOption('profile', null);
+const PROFILE_SLUG = PROFILE ? PROFILE.replace(/[^\w-]/g, '_') : null;
+
+const pad = (n) => String(n).padStart(2, '0');
+const fileStamp = (d = new Date()) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+
+const LOG_DIR = path.join(__dirname, 'logs');
+// One file per run with every attempt, plus runs.log with a one-line summary of each finished run.
+const RUN_LOG = path.join(LOG_DIR, `${fileStamp()}${PROFILE_SLUG ? `_${PROFILE_SLUG}` : ''}.log`);
+const HISTORY_LOG = path.join(LOG_DIR, 'runs.log');
 
 const CONFIG = {
   url: 'https://higgsfield.ai/ai/video?model=genjutsu',
   // Each --profile gets its own Chrome login folder so several copies can run side by side.
-  profileDir: path.join(__dirname, PROFILE ? `browser-profile-${PROFILE.replace(/[^\w-]/g, '_')}` : 'browser-profile'),
+  profileDir: path.join(__dirname, PROFILE_SLUG ? `browser-profile-${PROFILE_SLUG}` : 'browser-profile'),
   // 'complete' = retry until a video finishes rendering successfully.
   // 'submit'   = stop as soon as Higgsfield accepts the generation request.
   waitFor: flag('submit-only') ? 'submit' : 'complete',
@@ -51,9 +62,46 @@ const IGNORED_URLS = /sentry|amplitude|mixpanel|segment|posthog|analytics|teleme
 
 const isFailedStatus = (s) => FAILED_STATUS.test(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...m) => console.log(`[${new Date().toLocaleTimeString()}]${PROFILE ? ` [${PROFILE}]` : ''}`, ...m);
 const BOT_NAME = PROFILE ? `Higgsfield bot (${PROFILE})` : 'Higgsfield bot';
-const debug = (...m) => DEBUG && log('[debug]', ...m);
+const tag = PROFILE ? ` [${PROFILE}]` : '';
+
+function appendTo(file, line) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(file, `${line}\n`);
+  } catch {}
+}
+
+const log = (...m) => {
+  const text = m.join(' ');
+  console.log(`[${new Date().toLocaleTimeString()}]${tag}`, text);
+  appendTo(RUN_LOG, `[${new Date().toLocaleString()}]${tag} ${text}`);
+};
+// Debug lines are network noise, so they only go to the terminal.
+const debug = (...m) => DEBUG && console.log(`[${new Date().toLocaleTimeString()}]${tag} [debug]`, ...m);
+
+function formatDuration(ms) {
+  const total = Math.round(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+const triesText = (n) => `${n} ${n === 1 ? 'try' : 'tries'}`;
+
+// Prints the end-of-run summary and records it in runs.log.
+function recordRun(state, outcome, detail) {
+  const tries = state.tries ?? 0;
+  const duration = state.startedAt ? formatDuration(Date.now() - state.startedAt) : '0s';
+  const summary = `${outcome} after ${triesText(tries)} in ${duration}${detail ? ` (${detail})` : ''}`;
+  log(summary);
+  const started = state.startedAt ? new Date(state.startedAt).toLocaleString() : 'not started';
+  appendTo(HISTORY_LOG, `${started} | ${PROFILE ?? 'default'} | ${outcome} | ${triesText(tries)} | ${duration}${detail ? ` | ${detail}` : ''}`);
+  return summary;
+}
 
 function notify(title, message) {
   execFile('osascript', ['-e', `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)} sound name "Glass"`], () => {});
@@ -405,6 +453,7 @@ async function run(page, state) {
     if (click === 'busy') continue;
     if (click === 'missing') return { ok: false, reason: 'Could not find an enabled Generate button for 2 minutes.' };
     n++;
+    state.tries = n;
     log(`Attempt ${n}${Number.isFinite(CONFIG.maxAttempts) ? `/${CONFIG.maxAttempts}` : ''}: clicked Generate`);
 
     let outcome = await waitForSubmit(page, state, attempt, baseline);
@@ -458,6 +507,9 @@ async function main() {
     cancelTries: new Map(),
     apiHeaders: {},
     untracked: false,
+    tries: 0,
+    startedAt: null,
+    finished: false,
   };
 
   await page.addInitScript(installWatcher, watcherConfig);
@@ -465,6 +517,7 @@ async function main() {
   await page.goto(CONFIG.url, { waitUntil: 'domcontentloaded' });
 
   process.on('SIGINT', async () => {
+    if (state.startedAt && !state.finished) recordRun(state, 'STOPPED BY YOU');
     log('Stopping bot.');
     await context.close().catch(() => {});
     process.exit(0);
@@ -482,17 +535,21 @@ Higgsfield Genjutsu auto-generate bot${PROFILE ? ` (profile: ${PROFILE})` : ''}
 `);
   await ask('Press Enter to start... ');
 
+  state.startedAt = Date.now();
+  log('Run started');
   startWatchdog(page, state);
   const result = await run(page, state);
   state.attempt = null;
+  state.finished = true;
 
   if (result.ok) {
-    log('SUCCESS! Your generation passed.');
-    notify(BOT_NAME, 'Your Genjutsu generation passed!');
+    const summary = recordRun(state, 'SUCCESS');
+    notify(BOT_NAME, `Your Genjutsu generation passed! ${summary}`);
   } else {
-    log(result.reason);
-    notify(BOT_NAME, result.reason);
+    const summary = recordRun(state, 'STOPPED', result.reason);
+    notify(BOT_NAME, summary);
   }
+  log(`Log saved to ${path.relative(__dirname, RUN_LOG)} (all runs: ${path.relative(__dirname, HISTORY_LOG)})`);
   log('Browser stays open so you can check the result. Press Ctrl+C to quit.');
   await new Promise(() => {});
 }
